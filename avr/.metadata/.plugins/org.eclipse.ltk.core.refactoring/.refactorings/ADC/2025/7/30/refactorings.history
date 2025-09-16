@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Rename resource &apos;ADC/Core/Inc/imu10dof.h&apos; to &apos;sensor_10dof.h&apos;" description="Rename resource &apos;imu10dof.h&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="Core/Inc/imu10dof.h" name="sensor_10dof.h" stamp="1753343045180" updateReferences="true"/>&#x0A;<refactoring comment="Rename resource &apos;ADC/Core/Src/imu10dof.c&apos; to &apos;sensor_10dof.c&apos;" description="Rename resource &apos;imu10dof.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="Core/Src/imu10dof.c" name="sensor_10dof.c" stamp="1753343052428" updateReferences="true"/>
+</session>

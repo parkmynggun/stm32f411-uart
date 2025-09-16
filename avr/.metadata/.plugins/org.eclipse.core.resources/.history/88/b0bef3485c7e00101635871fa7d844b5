@@ -1,0 +1,170 @@
+// -----------------------------
+// pid_motor.c
+// -----------------------------
+#include "pid_motor.h"
+#include "tim.h"
+#include "gpio.h"
+#include <math.h>  // fabs
+
+// -----------------------------
+// PID 상태 변수 (좌우/상하 분리)
+// -----------------------------
+static float pid_integral_lr = 0;
+static float pid_prev_error_lr = 0;
+
+static float pid_integral_ud = 0;
+static float pid_prev_error_ud = 0;
+
+// 디버깅용 변수
+float pid_output_debug = 0;
+
+// -----------------------------
+// DC 모터 핀 정의
+// -----------------------------
+#define MOTOR_LR_IN1_PORT GPIOA
+#define MOTOR_LR_IN1_PIN  GPIO_PIN_0
+#define MOTOR_LR_IN2_PORT GPIOA
+#define MOTOR_LR_IN2_PIN  GPIO_PIN_1
+#define MOTOR_LR_PWM_CHANNEL TIM_CHANNEL_2
+#define MOTOR_LR_PWM_TIMER   &htim3
+
+#define MOTOR_UD_IN1_PORT GPIOB
+#define MOTOR_UD_IN1_PIN  GPIO_PIN_0
+#define MOTOR_UD_IN2_PORT GPIOB
+#define MOTOR_UD_IN2_PIN  GPIO_PIN_1
+#define MOTOR_UD_PWM_CHANNEL TIM_CHANNEL_3
+#define MOTOR_UD_PWM_TIMER   &htim3
+
+#define MOTOR_PWM_NEUTRAL 100
+#define MOTOR_PWM_MAX     200
+#define MOTOR_PWM_MIN     0
+
+// -----------------------------
+// 초기화
+// -----------------------------
+void PID_Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    HAL_TIM_PWM_Start(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    pid_integral_lr = 0;
+    pid_prev_error_lr = 0;
+    pid_integral_ud = 0;
+    pid_prev_error_ud = 0;
+    pid_output_debug = 0;
+
+    HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+}
+
+// -----------------------------
+// PID 제어 + DC 모터 제어
+// -----------------------------
+void Turret_PID_Control(float dt, float ir_distances[])
+{
+    // 좌우 센서
+    float left  = ir_distances[0];
+    float right = ir_distances[1];
+    float total_lr = left + right;
+
+    // 상하 센서
+    float up    = ir_distances[2];
+    float down  = ir_distances[3];
+    float total_ud = up + down;
+
+    const float DIST_THRESHOLD = 50.0f; // 감지 기준
+
+    float output_lr = 0;
+    float output_ud = 0;
+
+    // -----------------------------
+    // 좌우 PID
+    // -----------------------------
+    if(total_lr > DIST_THRESHOLD) {
+        float error = right - left;
+        const float Kp = 5.0f;
+        const float Ki = 1.1f;
+        const float Kd = 5.0f;
+        pid_integral_lr += error * dt;
+        float derivative = (error - pid_prev_error_lr) / dt;
+        output_lr = Kp*error + Ki*pid_integral_lr + Kd*derivative;
+        pid_prev_error_lr = error;
+    } else {
+        output_lr = 50.0f; // 무한 회전
+        // I 항 초기화하지 않음
+    }
+
+    // -----------------------------
+    // 상하 PID
+    // -----------------------------
+    if(total_ud > DIST_THRESHOLD) {
+        float error_ud = down - up;
+        const float Kp = 5.0f;
+        const float Ki = 5.1f;
+        const float Kd = 5.0f;
+        pid_integral_ud += error_ud * dt;
+        float derivative_ud = (error_ud - pid_prev_error_ud) / dt;
+        output_ud = Kp*error_ud + Ki*pid_integral_ud + Kd*derivative_ud;
+        pid_prev_error_ud = error_ud;
+    } else {
+        output_ud = 50.0f; // 무한 회전
+        // I 항 초기화하지 않음
+    }
+
+    // -----------------------------
+    // 출력 제한
+    // -----------------------------
+    if(output_lr > 100.0f) output_lr = 100.0f;
+    else if(output_lr < -100.0f) output_lr = -100.0f;
+
+    if(output_ud > 100.0f) output_ud = 100.0f;
+    else if(output_ud < -100.0f) output_ud = -100.0f;
+
+    pid_output_debug = output_lr; // 좌우 디버깅용
+
+    // -----------------------------
+    // PWM 적용
+    // -----------------------------
+    int16_t pwm_lr = MOTOR_PWM_NEUTRAL + (int16_t)fabs(output_lr);
+    int16_t pwm_ud = MOTOR_PWM_NEUTRAL + (int16_t)fabs(output_ud);
+    if(pwm_lr > MOTOR_PWM_MAX) pwm_lr = MOTOR_PWM_MAX;
+    if(pwm_lr < MOTOR_PWM_MIN) pwm_lr = MOTOR_PWM_MIN;
+    if(pwm_ud > MOTOR_PWM_MAX) pwm_ud = MOTOR_PWM_MAX;
+    if(pwm_ud < MOTOR_PWM_MIN) pwm_ud = MOTOR_PWM_MIN;
+
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, pwm_lr);
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, pwm_ud);
+
+    // -----------------------------
+    // 좌우 방향
+    // -----------------------------
+    if(output_lr > 0) {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    } else if(output_lr < 0) {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    }
+
+    // -----------------------------
+    // 상하 방향
+    // -----------------------------
+    if(output_ud > 0) {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+    } else if(output_ud < 0) {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+    }
+}

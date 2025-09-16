@@ -1,0 +1,238 @@
+#include "pid_motor.h"
+#include "tim.h"
+#include "gpio.h"
+#include <math.h>  // fabsf
+#include "motor.h" // IsDoorOpen() 사용
+
+// -----------------------------
+// PID 상태 변수 (좌우/상하 분리)
+static float pid_integral_lr = 0;
+static float pid_prev_error_lr = 0;
+static float pid_integral_ud = 0;
+static float pid_prev_error_ud = 0;
+
+// 물체 탐지 플래그
+static uint8_t search_mode = 1;  // 1=탐색모드(회전), 0=추적모드(PID)
+
+// 디버깅용 변수
+float pid_output_debug = 0;
+float pid_p_debug_lr = 0;
+float pid_i_debug_lr = 0;
+float pid_d_debug_lr = 0;
+float pid_p_debug_ud = 0;
+float pid_i_debug_ud = 0;
+float pid_d_debug_ud = 0;
+
+// -----------------------------
+// DC 모터 핀 정의
+#define MOTOR_LR_IN1_PORT GPIOC
+#define MOTOR_LR_IN1_PIN  GPIO_PIN_0
+#define MOTOR_LR_IN2_PORT GPIOC
+#define MOTOR_LR_IN2_PIN  GPIO_PIN_1
+#define MOTOR_LR_PWM_CHANNEL TIM_CHANNEL_2
+#define MOTOR_LR_PWM_TIMER   &htim3
+
+#define MOTOR_UD_IN1_PORT GPIOB
+#define MOTOR_UD_IN1_PIN  GPIO_PIN_1
+#define MOTOR_UD_IN2_PORT GPIOB
+#define MOTOR_UD_IN2_PIN  GPIO_PIN_2
+#define MOTOR_UD_PWM_CHANNEL TIM_CHANNEL_3
+#define MOTOR_UD_PWM_TIMER   &htim3
+
+#define MOTOR_PWM_NEUTRAL 0
+#define MOTOR_PWM_MAX     999
+#define MOTOR_PWM_MIN     0
+
+// -----------------------------
+// 초기화
+void PID_Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    HAL_TIM_PWM_Start(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    pid_integral_lr = 0;
+    pid_prev_error_lr = 0;
+    pid_integral_ud = 0;
+    pid_prev_error_ud = 0;
+
+    search_mode = 1;  // 시작시 탐색모드
+
+    HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+}
+
+// -----------------------------
+// Turret PID 제어 + DC 모터 제어
+void Turret_PID_Control(float dt, float ir_distances[])
+{
+    // 문 상태 확인
+    uint8_t door_open = IsDoorOpen();
+    if(!door_open)
+    {
+        // 문 닫힘: 모터 멈춤 + PID 적분 리셋
+        __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+        __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+
+        // PID 상태 리셋
+        pid_integral_lr = 0;
+        pid_prev_error_lr = 0;
+        pid_integral_ud = 0;
+        pid_prev_error_ud = 0;
+        search_mode = 1;  // 탐색모드로 리셋
+        return;
+    }
+
+    float left  = ir_distances[0];
+    float right = ir_distances[1];
+    float up    = ir_distances[2];
+    float down  = ir_distances[3];
+
+    // 플래그 기반 물체 탐지
+    const float OBJECT_THRESHOLD = 100.0f;  // 100cm 이하면 물체 있음
+
+    // 하나라도 100cm 이하면 추적모드
+    if(left < OBJECT_THRESHOLD || right < OBJECT_THRESHOLD ||
+       up < OBJECT_THRESHOLD || down < OBJECT_THRESHOLD) {
+        search_mode = 0;  // 추적모드
+    }
+    // 모든 센서가 100cm 이상이면 탐색모드
+    else {
+        search_mode = 1;  // 탐색모드
+    }
+
+    // ★★★ 탐색모드: 시계방향 계속 회전 ★★★
+    if(search_mode == 1) {
+        // 시계방향 회전
+        __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, 300);
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+
+        // 상하 모터 정지
+        __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, 0);
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+
+        // PID 상태 리셋
+        pid_integral_lr = 0;
+        pid_prev_error_lr = 0;
+        pid_integral_ud = 0;
+        pid_prev_error_ud = 0;
+
+        // 디버그 정보
+        pid_output_debug = 300;
+        return;  // 여기서 함수 종료
+    }
+
+    // ★★★ 추적모드: PID 제어 ★★★
+    // PID 상수
+    const float Kp_lr = 1.8f, Ki_lr = 0.3f, Kd_lr = 0.1f;
+    const float Kp_ud = 1.8f, Ki_ud = 0.3f, Kd_ud = 0.1f;
+    const float ERROR_THRESHOLD = 5.0f;
+    const float INTEGRAL_MAX = 50.0f;
+
+    // 좌우 PID 계산
+    float error_lr = right - left;
+
+    // 데드존 적용
+    if(fabsf(error_lr) < ERROR_THRESHOLD) {
+        error_lr = 0;
+        pid_integral_lr = 0;
+    } else {
+        pid_integral_lr += error_lr * dt;
+        if(pid_integral_lr > INTEGRAL_MAX) pid_integral_lr = INTEGRAL_MAX;
+        else if(pid_integral_lr < -INTEGRAL_MAX) pid_integral_lr = -INTEGRAL_MAX;
+    }
+
+    float derivative_lr = (error_lr - pid_prev_error_lr) / dt;
+    pid_prev_error_lr = error_lr;
+
+    pid_p_debug_lr = Kp_lr * error_lr;
+    pid_i_debug_lr = Ki_lr * pid_integral_lr;
+    pid_d_debug_lr = Kd_lr * derivative_lr;
+
+    float output_lr = pid_p_debug_lr + pid_i_debug_lr + pid_d_debug_lr;
+
+    // 상하 PID 계산
+    float error_ud = down - up;
+
+    if(fabsf(error_ud) < ERROR_THRESHOLD) {
+        error_ud = 0;
+        pid_integral_ud = 0;
+    } else {
+        pid_integral_ud += error_ud * dt;
+        if(pid_integral_ud > INTEGRAL_MAX) pid_integral_ud = INTEGRAL_MAX;
+        else if(pid_integral_ud < -INTEGRAL_MAX) pid_integral_ud = -INTEGRAL_MAX;
+    }
+
+    float derivative_ud = (error_ud - pid_prev_error_ud) / dt;
+    pid_prev_error_ud = error_ud;
+
+    pid_p_debug_ud = Kp_ud * error_ud;
+    pid_i_debug_ud = Ki_ud * pid_integral_ud;
+    pid_d_debug_ud = Kd_ud * derivative_ud;
+
+    float output_ud = pid_p_debug_ud + pid_i_debug_ud + pid_d_debug_ud;
+
+    pid_output_debug = output_lr;
+
+    // 출력 제한
+    if(output_lr > 80.0f) output_lr = 80.0f;
+    else if(output_lr < -80.0f) output_lr = -80.0f;
+
+    if(output_ud > 80.0f) output_ud = 80.0f;
+    else if(output_ud < -80.0f) output_ud = -80.0f;
+
+    // PWM 계산
+    int16_t pwm_lr = (int16_t)(output_lr * 5.0f);
+    int16_t pwm_ud = (int16_t)(output_ud * 5.0f);
+
+    if(pwm_lr > MOTOR_PWM_MAX) pwm_lr = MOTOR_PWM_MAX;
+    if(pwm_lr < -MOTOR_PWM_MAX) pwm_lr = -MOTOR_PWM_MAX;
+
+    if(pwm_ud > MOTOR_PWM_MAX) pwm_ud = MOTOR_PWM_MAX;
+    if(pwm_ud < -MOTOR_PWM_MAX) pwm_ud = -MOTOR_PWM_MAX;
+
+    // 최소 PWM 임계값
+    if(abs(pwm_lr) > 0 && abs(pwm_lr) < 100) {
+        pwm_lr = (pwm_lr > 0) ? 100 : -100;
+    }
+    if(abs(pwm_ud) > 0 && abs(pwm_ud) < 100) {
+        pwm_ud = (pwm_ud > 0) ? 100 : -100;
+    }
+
+    // PWM 적용
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, abs(pwm_lr));
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, abs(pwm_ud));
+
+    // 모터 방향 설정
+    if(pwm_lr > 0) {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    } else if(pwm_lr < 0) {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    }
+
+    if(pwm_ud > 0) {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+    } else if(pwm_ud < 0) {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+    }
+}

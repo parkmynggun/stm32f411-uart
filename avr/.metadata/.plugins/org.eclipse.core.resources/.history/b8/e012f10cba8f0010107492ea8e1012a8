@@ -1,0 +1,92 @@
+#include <stdint.h>
+#include <stdio.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xparameters.h"
+#include "sleep.h"
+
+#define MYIP_BASEADDR XPAR_MYIP_ADC_NEW_0_BASEADDR
+#define UART_BASEADDR XPAR_AXI_UARTLITE_1_BASEADDR
+
+uint32_t adc_scaled[4] = {0,0,0,0}; // 보정된 값 (0..4095)
+
+// 8비트 UART 전송
+void simple_uart_send_char(char c) {
+    while (Xil_In32(UART_BASEADDR + 0x8) & 0x8) { }  // TX Full이면 대기
+    Xil_Out8(UART_BASEADDR + 0x4, c);                // 8비트 전송
+}
+
+// 문자열 송신 (한 글자씩)
+void simple_uart_send_string(char* str) {
+    while (*str) {
+        simple_uart_send_char(*str);
+        usleep(1);  // 작은 딜레이 추가
+        str++;
+    }
+}
+
+// ADC 보정 함수
+uint32_t remap_adc(uint32_t raw, uint32_t raw_min, uint32_t raw_max) {
+    if (raw_max <= raw_min) return 0;
+    if (raw <= raw_min) return 0;
+    if (raw >= raw_max) return 4095;
+    uint64_t numer = (uint64_t)(raw - raw_min) * 4095;
+    uint32_t denom = raw_max - raw_min;
+    return (uint32_t)(numer / denom);
+}
+
+int main() {
+    init_platform();
+
+    print("DEBUG: System initialized\n\r");
+    simple_uart_send_string("UART Test Start\r\n");
+
+    const uint32_t RAW_MIN[4] = {8, 8, 7, 7};
+    const uint32_t RAW_MAX[4] = {900, 900, 900, 900};
+
+    u32 adc_raw[4];
+    int print_counter = 0;
+    int uart_counter = 0;
+
+    while (1) {
+        // ADC 읽기
+        adc_raw[0] = Xil_In32(MYIP_BASEADDR + 0x0) & 0xFFF;
+        adc_raw[1] = Xil_In32(MYIP_BASEADDR + 0x4) & 0xFFF;
+        adc_raw[2] = Xil_In32(MYIP_BASEADDR + 0x8) & 0xFFF;
+        adc_raw[3] = Xil_In32(MYIP_BASEADDR + 0xC) & 0xFFF;
+
+        // 보정
+        for (int i=0;i<4;i++)
+            adc_scaled[i] = remap_adc(adc_raw[i], RAW_MIN[i], RAW_MAX[i]);
+
+        // 디버깅 출력
+        print_counter++;
+        if (print_counter >= 1000) {
+            xil_printf("DEBUG: X1=%4d, Y1=%4d, X2=%4d, Y2=%4d (RAW: %4d,%4d,%4d,%4d)\n",
+                adc_scaled[0], adc_scaled[1], adc_scaled[2], adc_scaled[3],
+                adc_raw[0], adc_raw[1], adc_raw[2], adc_raw[3]);
+            print_counter = 0;
+        }
+
+        // UART 전송
+        uart_counter++;
+        if (uart_counter >= 5000) {
+            simple_uart_send_string("ADC:");
+            for (int i=0;i<4;i++){
+                char buf[6];
+                sprintf(buf, "%d", adc_scaled[i]);
+                simple_uart_send_string(buf);
+                if (i<3) simple_uart_send_char(',');  // ',' 추가
+                usleep(5);  // 작은 지연
+            }
+            simple_uart_send_string("\r\n");
+            print("DEBUG: Data sent to UART\r\n");
+            uart_counter = 0;
+        }
+
+        usleep(10);
+    }
+
+    cleanup_platform();
+    return 0;
+}

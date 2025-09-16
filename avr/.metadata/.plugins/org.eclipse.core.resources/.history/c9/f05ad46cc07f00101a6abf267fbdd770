@@ -1,0 +1,87 @@
+#include "motor.h"
+#include "tim.h"
+#include "gpio.h"
+
+// -----------------------------
+// 상태 변수
+// -----------------------------
+uint8_t is_door_open = 0;  // 문 열림 상태
+uint8_t is_door_off  = 0;  // 문 닫힘 상태 초기값
+
+uint16_t servo_ccr_value = 0; // CCR 디버깅용
+
+extern uint8_t current_floor;
+extern uint8_t target_floor;
+
+// -----------------------------
+// 디바운스 함수
+// -----------------------------
+static uint8_t readDebounce(GPIO_TypeDef* port, uint16_t pin)
+{
+    if(HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET) // 눌렸다면
+    {
+        HAL_Delay(20); // 20ms 디바운싱
+        if(HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET)
+            return 1;
+    }
+    return 0;
+}
+
+// -----------------------------
+// 모터 초기화
+// -----------------------------
+void Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // PWM 시작
+    TIM3->CCR1 = 50;                           // 서보 중립 위치
+    servo_ccr_value = TIM3->CCR1;              // 디버깅용 저장
+
+    HAL_Delay(500);
+}
+
+// -----------------------------
+// 버튼 처리
+// -----------------------------
+void Motor_HandleInput(void)
+{
+    // 문 열림 버튼
+    if(readDebounce(GPIOC, GPIO_PIN_9) && is_door_open == 0)
+    {
+        if(TIM3->CCR1 != 50) TIM3->CCR1 = 25; // CCR 보호
+        servo_ccr_value = TIM3->CCR1;
+        HAL_Delay(500);
+        is_door_open = 1;
+        is_door_off  = 0;
+
+    }
+    // 문 닫힘 버튼
+    else if(readDebounce(GPIOB, GPIO_PIN_8) && is_door_off == 0)
+    {
+        if(TIM3->CCR1 != 100) TIM3->CCR1 = 120; // CCR 보호
+        servo_ccr_value = TIM3->CCR1;
+        HAL_Delay(500);
+        is_door_off  = 1;
+        is_door_open = 0;
+
+    }
+}
+
+
+
+uint8_t IsDoorOpen(void)
+{
+	   return is_door_open;
+}
+void Motor_TestLoop(void)
+{
+    while(1)
+    {
+        TIM3->CCR1 = 25;             // -180도
+        servo_ccr_value = TIM3->CCR1; // 디버거 표시용
+        HAL_Delay(500);
+
+        TIM3->CCR1 = 120;            // +180도
+        servo_ccr_value = TIM3->CCR1; // 디버거 표시용
+        HAL_Delay(500);
+    }
+}

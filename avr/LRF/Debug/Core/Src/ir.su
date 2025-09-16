@@ -1,0 +1,11 @@
+../Core/Src/ir.c:28:6:IR_Init	16	static
+../Core/Src/ir.c:40:13:IR_StartADC	32	static
+../Core/Src/ir.c:50:6:IR_StartReadAll	8	static
+../Core/Src/ir.c:60:6:IR_IRQHandler	40	static
+../Core/Src/ir.c:116:9:IR_IsObjectDetected	4	static
+../Core/Src/ir.c:117:10:IR_GetObjectLostTime	8	static
+../Core/Src/ir.c:118:7:IR_GetMinDistance	16	static
+../Core/Src/ir.c:119:8:IR_GetObjectDirection	24	static
+../Core/Src/ir.c:120:6:IR_SetDummyValue	16	static
+../Core/Src/ir.c:121:6:IR_SetDummyMode	16	static
+../Core/Src/ir.c:122:6:IR_ResetDetectionState	8	static

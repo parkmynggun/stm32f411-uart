@@ -1,0 +1,336 @@
+#include "motor.h"
+
+#include "main.h"
+
+#include <stdlib.h>
+
+uint8_t rxData = 0;
+uint8_t toggleModeFlag = 0;  // 'x' 토글 플래그로 변경
+volatile uint8_t newValueFlag = 0;
+static uint32_t lastToggleTime = 0;  // 토글 디바운싱용
+
+volatile uint16_t currentCcrLeft = 0;
+volatile uint16_t currentCcrRight = 0;
+volatile uint16_t targetCcrLeft = 0;
+volatile uint16_t targetCcrRight = 0;
+volatile uint16_t lastSpeed = 300;
+
+volatile MotorMode_t currentMode = MODE_MANUAL;
+
+
+// 거리 변수 (초음파 센서에서 업데이트)
+
+
+// 모드 확인 함수
+MotorMode_t GetCurrentMode(void)
+{
+    // PC1 = 1, PC0 = 0 -> 자동모드
+    // PC1 = 0, PC0 = 1 -> 수동모드
+    // 다른 경우 -> 수동모드 (기본값)
+
+    GPIO_PinState pc1 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+    GPIO_PinState pc0 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
+
+    if (pc1 == GPIO_PIN_SET && pc0 == GPIO_PIN_RESET)
+    {
+        return MODE_AUTO;
+    }
+    else
+    {
+        return MODE_MANUAL;
+    }
+}
+
+// UART 인터럽트 - 디바운싱 추가
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        uint32_t currentTime = HAL_GetTick();
+
+        if (rxData == 'x')
+        {
+            // 디바운싱: 500ms 이내 중복 'x' 무시
+            if (currentTime - lastToggleTime > 500)
+            {
+                toggleModeFlag = 1;
+                lastToggleTime = currentTime;
+            }
+        }
+        else
+        {
+            newValueFlag = 1;  // 일반 명령 처리용
+        }
+
+        HAL_UART_Receive_IT(&huart1, &rxData, 1);  // 다음 수신 준비
+    }
+}
+
+// PWM 점진 적용
+void UpdateMotorSpeed(void)
+{
+    if (currentCcrLeft < targetCcrLeft)
+        currentCcrLeft = (currentCcrLeft + SPEED_STEP > targetCcrLeft) ? targetCcrLeft : currentCcrLeft + SPEED_STEP;
+    else if (currentCcrLeft > targetCcrLeft)
+        currentCcrLeft = (currentCcrLeft < SPEED_STEP + targetCcrLeft) ? targetCcrLeft : currentCcrLeft - SPEED_STEP;
+
+    if (currentCcrRight < targetCcrRight)
+        currentCcrRight = (currentCcrRight + SPEED_STEP > targetCcrRight) ? targetCcrRight : currentCcrRight + SPEED_STEP;
+    else if (currentCcrRight > targetCcrRight)
+        currentCcrRight = (currentCcrRight < SPEED_STEP + targetCcrRight) ? targetCcrRight : currentCcrRight - SPEED_STEP;
+
+    TIM3->CCR2 = (currentCcrLeft < 200) ? 0 : currentCcrLeft;
+    TIM4->CCR2 = (currentCcrRight < 200) ? 0 : currentCcrRight;
+}
+
+// 모터 방향 설정 (GPIO 초기화 후 방향 설정)
+void SetMotorDirection_Safe(void)
+{
+    // 모든 GPIO 핀 초기화
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+}
+
+// 수동 모드 명령 처리
+void ProcessManualCommand(void)
+{
+
+
+	currentMode = GetCurrentMode();  // 모드 갱신
+    if (rxData >= '1' && rxData <= '9')
+    {
+        uint8_t level = rxData - '0';
+        uint16_t speed = level * 100;
+        lastSpeed = speed;
+        targetCcrLeft = speed;
+        targetCcrRight = speed;
+
+        char msg[60];
+        sprintf(msg, "[MANUAL] Speed %d -> CCR %d\r\n", level, speed);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+    }
+    else
+    {
+        SetMotorDirection_Safe();
+
+        switch(rxData)
+        {
+            case 'F':  // 전진
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed;
+                targetCcrRight = lastSpeed;
+                break;
+
+            case 'G':  // 전진 + 우회전
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed / 2;
+                targetCcrRight = lastSpeed;
+                break;
+
+            case 'H':  // 전진 + 좌회전
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed;
+                targetCcrRight = lastSpeed / 2;
+                break;
+
+            case 'B':  // 후진
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed;
+                targetCcrRight = lastSpeed;
+                break;
+
+            case 'I':  // 후진 + 우회전
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed / 2;
+                targetCcrRight = lastSpeed;
+                break;
+
+            case 'J':  // 후진 + 좌회전
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed;
+                targetCcrRight = lastSpeed / 2;
+                break;
+
+            case 'R':  // 제자리 우회전
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed;
+                targetCcrRight = lastSpeed;
+                break;
+
+            case 'L':  // 제자리 좌회전
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+                targetCcrLeft = lastSpeed;
+                targetCcrRight = lastSpeed;
+                break;
+
+            case 'S':  // 정지
+            case '0':
+                targetCcrLeft = 0;
+                targetCcrRight = 0;
+                break;
+        }
+
+        char msg[60];
+        sprintf(msg, "[MANUAL] %c -> L:%d, R:%d\r\n", rxData, targetCcrLeft, targetCcrRight);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+    }
+}
+
+// 자동 모드 거리 기반 제어
+void HandleDistanceAndAutoBehavior(void)
+{
+    static uint32_t lastActionTime = 0;
+    static int8_t lastTurnDir = -1;
+    static uint8_t avoidanceInProgress = 0;
+    static uint32_t avoidanceStartTime = 0;
+    static uint16_t prevCH1 = 100, prevCH2 = 100, prevCH3 = 100;
+    uint32_t currentTime = HAL_GetTick();
+
+    uint16_t filterSensorValue(uint16_t currentVal, uint16_t prevVal) {
+        if (currentVal > 80 || currentVal < 3) return 100;
+        if (abs(currentVal - prevVal) > 40 && prevVal < 80 && currentVal < 80)
+            return (prevVal + currentVal) / 2;
+        return currentVal;
+    }
+
+    uint16_t calculateSpeed(uint16_t dist, uint16_t baseSpeed) {
+        if (dist < 25)
+            return (uint16_t)(baseSpeed * 0.70f); // 50cm 이하일 때 35% 속도
+        if (dist > 65)
+            return baseSpeed;
+        float ratio = 0.70f + ((float)(dist - 25) / (65 - 25)) * 0.30f; // 50~65cm 사이 선형 증가
+        return (uint16_t)(baseSpeed * ratio);
+    }
+
+    // 긴급 회피 타이머 해제
+    if (avoidanceInProgress && (currentTime - avoidanceStartTime > 5000)) {
+        avoidanceInProgress = 0;
+    }
+
+    // 회피 중일 때 시간 체크하여 단계별 처리
+    if (avoidanceInProgress) {
+        uint32_t elapsed = currentTime - avoidanceStartTime;
+
+        if (elapsed < 1) {
+            // 0~300ms: 회전 유지
+            UpdateMotorSpeed();
+            return;
+        } else if (elapsed < 1) {
+            // 300~500ms: 정지
+            SetMotorDirection_Safe();
+            targetCcrLeft = targetCcrRight = 0;
+            UpdateMotorSpeed();
+            return;
+        } else {
+            // 500ms 이후: 회피 종료
+            avoidanceInProgress = 0;
+        }
+
+
+
+// 모터 제어 메인 함수 - 안정적인 토글 처리
+void ProcessMotorCommand(void)
+{
+    // 'x' 토글 처리 - 한 번만 실행되도록 보장
+    if (toggleModeFlag)
+    {
+        toggleModeFlag = 0;  // 플래그 즉시 클리어
+
+        // 현재 모드에서 반대 모드로 전환
+        if (currentMode == MODE_MANUAL)
+        {
+            currentMode = MODE_AUTO;
+            SetMotorDirection_Safe();
+            targetCcrLeft = 0;
+            targetCcrRight = 0;
+            char msg[] = "[MODE] MANUAL -> AUTO (Toggle)\r\n";
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+        }
+        else
+        {
+            currentMode = MODE_MANUAL;
+            SetMotorDirection_Safe();
+            targetCcrLeft = 0;
+            targetCcrRight = 0;
+            char msg[] = "[MODE] AUTO -> MANUAL (Toggle)\r\n";
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+        }
+
+        // 토글 후 약간의 딜레이를 주어 안정화
+        osDelay(50);
+    }
+
+    // 모드별 명령 처리
+    if (currentMode == MODE_MANUAL)
+    {
+        if (newValueFlag)
+        {
+            newValueFlag = 0;
+            ProcessManualCommand();
+        }
+    }
+    else if (currentMode == MODE_AUTO)
+    {
+        HandleDistanceAndAutoBehavior();
+
+        if (newValueFlag && (rxData == 'S' || rxData == '0'))
+        {
+            newValueFlag = 0;
+            SetMotorDirection_Safe();
+            targetCcrLeft = 0;
+            targetCcrRight = 0;
+            char msg[] = "[AUTO] Emergency Stop\r\n";
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+        }
+    }
+
+    UpdateMotorSpeed();
+}
+
+// 모터 초기화 함수
+void Motor_Init(void)
+{
+    // PWM 시작
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+
+    // 초기값 설정
+    currentCcrLeft = 0;
+    currentCcrRight = 0;
+    targetCcrLeft = 0;
+    targetCcrRight = 0;
+
+    // 모터 정지 상태로 초기화
+    SetMotorDirection_Safe();
+
+    // 초기 모드 설정
+    currentMode = GetCurrentMode();
+
+    // UART 수신 인터럽트 시작
+    HAL_UART_Receive_IT(&huart1, &rxData, 1);
+
+    char msg[40];
+    sprintf(msg, "[INIT] Mode: %s\r\n", (currentMode == MODE_AUTO) ? "AUTO" : "MANUAL");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}
+
+// 거리 업데이트 함수 (초음파 센서에서 호출)
+void UpdateDistances(uint16_t d1, uint16_t d2, uint16_t d3)
+{
+    if (currentMode == MODE_AUTO)
+    {
+        distance_CH1 = d1;
+        distance_CH2 = d2;
+        distance_CH3 = d3;
+    }
+}

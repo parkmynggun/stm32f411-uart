@@ -1,0 +1,5 @@
+../Core/Src/sensor_10dof.c:18:26:BMP180_ReadCalibrationData	48	static
+../Core/Src/sensor_10dof.c:40:19:Sensor10DOF_Init	40	static
+../Core/Src/sensor_10dof.c:63:19:Sensor10DOF_ReadMPU6050	48	static
+../Core/Src/sensor_10dof.c:77:19:Sensor10DOF_ReadHMC5883L	40	static
+../Core/Src/sensor_10dof.c:90:19:Sensor10DOF_ReadBMP180	56	static

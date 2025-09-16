@@ -1,0 +1,358 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : STM32 ADC Monitor (Basys3 + HC-05)
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart2;
+
+#define RX_BUF_SIZE 64
+uint8_t rxData;                // 수신 1바이트
+char rx_buf[RX_BUF_SIZE];      // 라인 버퍼
+uint8_t rx_index = 0;
+volatile uint8_t rx_complete = 0;  // 수신 완료 플래그 추가
+
+uint32_t joystick[4] = {0, 0, 0, 0};          // 최신 값 초기화
+uint32_t last_joystick[4] = {0, 0, 0, 0};     // END 신호 시 저장
+uint8_t is_neutral = 0;
+uint32_t test_counter = 0;     // 테스트 카운터 추가
+
+uint8_t toggleModeFlag = 0;  // 'x' 토글 플래그로 변경
+volatile uint8_t newValueFlag = 0;
+static uint32_t lastToggleTime = 0;  // 토글 디바운싱용
+
+volatile uint16_t currentCcrLeft = 0;
+volatile uint16_t currentCcrRight = 0;
+volatile uint16_t targetCcrLeft = 0;
+volatile uint16_t targetCcrRight = 0;
+volatile uint16_t lastSpeed = 300;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+#ifdef __GNUC__
+#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+#define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif
+
+PUTCHAR_PROTOTYPE
+{
+    if(ch == '\n') HAL_UART_Transmit(&huart2, (uint8_t*)"\r", 1, 1000);
+    HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, 1000);
+    return ch;
+}
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        // 디버그: 수신된 바이트를 즉시 출력 (16진수와 문자)
+        printf("RX: 0x%02X (%d) '%c'\r\n", rxData, rxData,
+               (rxData >= 32 && rxData <= 126) ? rxData : '.');
+
+        // 유효한 ASCII 문자만 처리 (32~126)
+        if (rxData >= 32 && rxData <= 126)
+        {
+            if (rxData == '\n' || rxData == '\r')
+            {
+                // 라인 종료 문자 수신 시
+                if (rx_index > 0)
+                {
+                    rx_buf[rx_index] = '\0';  // 문자열 종료
+                    rx_complete = 1;          // 수신 완료 플래그 설정
+                    printf("Complete line: %s\r\n", rx_buf);
+                    rx_index = 0;             // 인덱스 초기화
+                }
+            }
+            else if (rx_index < RX_BUF_SIZE - 1)
+            {
+                // 일반 문자 수신 시 버퍼에 저장
+                rx_buf[rx_index++] = rxData;
+            }
+        }
+        else if (rxData == '\n' || rxData == '\r')
+        {
+            // 개행문자는 ASCII 범위 밖이지만 처리
+            if (rx_index > 0)
+            {
+                rx_buf[rx_index] = '\0';
+                rx_complete = 1;
+                printf("Complete line: %s\r\n", rx_buf);
+                rx_index = 0;
+            }
+        }
+        else
+        {
+            // 잘못된 데이터 수신 시 경고
+            printf("Invalid data received: 0x%02X\r\n", rxData);
+
+            // 연속으로 잘못된 데이터가 오면 버퍼 리셋
+            static uint8_t error_count = 0;
+            error_count++;
+            if (error_count > 5)
+            {
+                printf("Too many errors, resetting buffer\r\n");
+                rx_index = 0;
+                memset(rx_buf, 0, RX_BUF_SIZE);
+                error_count = 0;
+            }
+        }
+
+        // 다음 수신 준비
+        HAL_UART_Receive_IT(&huart1, &rxData, 1);
+    }
+}
+
+void Process_Received_Data(void)
+{
+    if (!rx_complete) return;
+
+    uint32_t currentTime = HAL_GetTick();
+
+    // 토글 명령 처리
+    if (strcmp(rx_buf, "x") == 0)
+    {
+        // 디바운싱: 500ms 이내 중복 'x' 무시
+        if (currentTime - lastToggleTime > 500)
+        {
+            toggleModeFlag = 1;
+            lastToggleTime = currentTime;
+            printf("Toggle mode received\r\n");
+        }
+    }
+    else if (strncmp(rx_buf, "ADC:", 4) == 0)
+    {
+        // ADC 데이터 파싱 예시: "ADC:1234,2345,3456,4567"
+        uint32_t temp_values[4];
+        int parsed = sscanf(rx_buf + 4, "%lu,%lu,%lu,%lu",
+                           &temp_values[0], &temp_values[1],
+                           &temp_values[2], &temp_values[3]);
+
+        if (parsed == 4)
+        {
+            // 유효한 데이터만 업데이트
+            for (int i = 0; i < 4; i++)
+            {
+                joystick[i] = temp_values[i];
+            }
+            newValueFlag = 1;
+            printf("ADC Data: %lu, %lu, %lu, %lu\r\n",
+                   joystick[0], joystick[1], joystick[2], joystick[3]);
+        }
+        else
+        {
+            printf("Parse error: %s\r\n", rx_buf);
+        }
+    }
+    else if (strcmp(rx_buf, "END") == 0)
+    {
+        // END 신호 처리
+        memcpy(last_joystick, joystick, sizeof(joystick));
+        printf("END signal received, values saved\r\n");
+    }
+    else
+    {
+        // 기타 명령 처리
+        printf("Received: %s\r\n", rx_buf);
+    }
+
+    // 수신 완료 플래그 클리어 및 버퍼 초기화
+    rx_complete = 0;
+    memset(rx_buf, 0, RX_BUF_SIZE);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_TIM3_Init();
+  MX_TIM4_Init();
+  /* USER CODE BEGIN 2 */
+
+    // 시스템 시작 메시지
+    printf("=== STM32 Bluetooth Receiver ===\r\n");
+    printf("Waiting for data from Basys3...\r\n");
+
+    // 변수 초기화
+    rx_index = 0;
+    rx_complete = 0;
+    memset(rx_buf, 0, RX_BUF_SIZE);
+
+    // UART 인터럽트 수신 시작
+    HAL_UART_Receive_IT(&huart1, &rxData, 1);
+    HAL_NVIC_SetPriority(TIM1_CC_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+    while(1)
+    {
+        // 수신된 데이터 처리
+        Process_Received_Data();
+
+        // 토글 모드 처리
+        if (toggleModeFlag)
+        {
+            toggleModeFlag = 0;
+            // 토글 모드 처리 로직 추가
+            printf("Processing toggle mode...\r\n");
+        }
+
+        // 새로운 값 처리
+        if (newValueFlag)
+        {
+            newValueFlag = 0;
+            // 새로운 값 처리 로직 추가
+            printf("Processing new values...\r\n");
+        }
+
+        HAL_Delay(10); // 10ms 딜레이로 변경 (더 빠른 응답)
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 12;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

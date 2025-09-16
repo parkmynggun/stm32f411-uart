@@ -1,0 +1,220 @@
+#include "motor.h"
+#include "main.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#define RX_BUF_SIZE 64
+#define SPEED_STEP 10
+#define ADC_HISTORY_SIZE 5
+
+// ----- UART & ADC 관련 -----
+uint8_t rxData = 0;
+uint8_t rxBuf[RX_BUF_SIZE];
+volatile uint8_t rxIndex = 0;
+
+volatile uint32_t adc_scaled[4] = {0,0,0,0};
+
+// 이동 평균 필터용 (필요시)
+volatile uint32_t adc_history[4][ADC_HISTORY_SIZE] = {{0}};
+volatile uint8_t adc_history_index = 0;
+
+// ----- 모터 관련 -----
+uint8_t toggleModeFlag = 0;
+volatile uint8_t newValueFlag = 0;
+
+volatile uint16_t currentCcrLeft = 0;
+volatile uint16_t currentCcrRight = 0;
+volatile uint16_t targetCcrLeft = 0;
+volatile uint16_t targetCcrRight = 0;
+volatile uint16_t lastSpeed = 300;
+
+volatile MotorMode_t currentMode = MODE_MANUAL;
+
+void HandleDistanceAndAutoBehavior(void);
+
+// ----- 모드 읽기 -----
+MotorMode_t GetCurrentMode(void)
+{
+    GPIO_PinState pc1 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+    GPIO_PinState pc0 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14);
+
+    if (pc1 == GPIO_PIN_SET && pc0 == GPIO_PIN_RESET)
+        return MODE_AUTO;
+    else
+        return MODE_MANUAL;
+}
+
+// ----- 수신 문자열 처리 -----
+void ProcessReceivedLine(uint8_t *line)
+{
+    char dbg[80];
+    sprintf(dbg, "RAW:'%s'\r\n", (char*)line);
+    HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), 100);
+
+    if (strncmp((char*)line, "ADC:", 4) == 0) {
+        uint32_t tmp[4] = {0};
+        int parsed = sscanf((char*)line, "ADC:%lu,%lu,%lu,%lu",
+                            &tmp[0], &tmp[1], &tmp[2], &tmp[3]);
+
+        if (parsed == 4) {
+            adc_scaled[0] = tmp[0];
+            adc_scaled[1] = tmp[1];
+            adc_scaled[2] = tmp[2];
+            adc_scaled[3] = tmp[3];
+        }
+
+        sprintf(dbg, "PARSED=%d [%lu,%lu,%lu,%lu]\r\n",
+                parsed, adc_scaled[0], adc_scaled[1], adc_scaled[2], adc_scaled[3]);
+        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), 100);
+    }
+}
+
+// ----- UART 수신 인터럽트 -----
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        if(rxIndex < RX_BUF_SIZE - 1) {
+            rxBuf[rxIndex++] = rxData;
+        } else {
+            rxIndex = 0;
+        }
+
+        if(rxData == '\n' || rxData == '\r') {
+            if(rxIndex > 0) rxBuf[rxIndex-1] = '\0';
+            else rxBuf[0] = '\0';
+
+            if(strlen((char*)rxBuf) > 0)
+                ProcessReceivedLine(rxBuf);
+
+            rxIndex = 0;
+        }
+
+        HAL_UART_Receive_IT(&huart1, &rxData, 1);
+    }
+}
+
+// ----- 모터 속도 업데이트 -----
+void UpdateMotorSpeed(void)
+{
+    if (currentCcrLeft < targetCcrLeft)
+        currentCcrLeft = (currentCcrLeft + SPEED_STEP > targetCcrLeft) ? targetCcrLeft : currentCcrLeft + SPEED_STEP;
+    else if (currentCcrLeft > targetCcrLeft)
+        currentCcrLeft = (currentCcrLeft - SPEED_STEP < targetCcrLeft) ? targetCcrLeft : currentCcrLeft - SPEED_STEP;
+
+    if (currentCcrRight < targetCcrRight)
+        currentCcrRight = (currentCcrRight + SPEED_STEP > targetCcrRight) ? targetCcrRight : currentCcrRight + SPEED_STEP;
+    else if (currentCcrRight > targetCcrRight)
+        currentCcrRight = (currentCcrRight - SPEED_STEP < targetCcrRight) ? targetCcrRight : currentCcrRight - SPEED_STEP;
+
+    TIM3->CCR2 = (currentCcrLeft < 200) ? 0 : currentCcrLeft;
+    TIM4->CCR2 = (currentCcrRight < 200) ? 0 : currentCcrRight;
+}
+
+// ----- 모터 방향 초기화 -----
+void SetMotorDirection_Safe(void)
+{
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+}
+
+// ----- 수동 모드 처리 -----
+void ProcessManualCommand(void)
+{
+    currentMode = GetCurrentMode();
+
+    if (rxData >= '1' && rxData <= '9')
+    {
+        uint8_t level = rxData - '0';
+        uint16_t speed = level * 100;
+        lastSpeed = speed;
+        targetCcrLeft = speed;
+        targetCcrRight = speed;
+
+        char msg[60];
+        sprintf(msg, "[MANUAL] Speed %d -> CCR %d\r\n", level, speed);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+    }
+    else
+    {
+        SetMotorDirection_Safe();
+        switch(rxData)
+        {
+            case 'F':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_4, GPIO_PIN_SET); targetCcrLeft=lastSpeed; targetCcrRight=lastSpeed; break;
+            case 'G':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_4, GPIO_PIN_SET); targetCcrLeft=lastSpeed/2; targetCcrRight=lastSpeed; break;
+            case 'H':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_4, GPIO_PIN_SET); targetCcrLeft=lastSpeed; targetCcrRight=lastSpeed/2; break;
+            case 'B':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); targetCcrLeft=lastSpeed; targetCcrRight=lastSpeed; break;
+            case 'I':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); targetCcrLeft=lastSpeed/2; targetCcrRight=lastSpeed; break;
+            case 'J':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); targetCcrLeft=lastSpeed; targetCcrRight=lastSpeed/2; break;
+            case 'R':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); targetCcrLeft=lastSpeed; targetCcrRight=lastSpeed; break;
+            case 'L':  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); targetCcrLeft=lastSpeed; targetCcrRight=lastSpeed; break;
+            case 'S':
+            case '0':  targetCcrLeft=0; targetCcrRight=0; break;
+        }
+
+        char msg[60];
+        sprintf(msg, "[MANUAL] %c -> L:%d, R:%d\r\n", rxData, targetCcrLeft, targetCcrRight);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 50);
+    }
+}
+
+// ----- 전체 모터 명령 처리 -----
+void ProcessMotorCommand(void)
+{
+    if (toggleModeFlag)
+    {
+        toggleModeFlag = 0;
+        currentMode = (currentMode == MODE_MANUAL) ? MODE_AUTO : MODE_MANUAL;
+        SetMotorDirection_Safe();
+        targetCcrLeft=0; targetCcrRight=0;
+
+        char msg[50];
+        sprintf(msg, "[MODE] Toggled -> %s\r\n",(currentMode==MODE_AUTO)?"AUTO":"MANUAL");
+        HAL_UART_Transmit(&huart2,(uint8_t*)msg,strlen(msg),100);
+
+        HAL_Delay(50);
+    }
+
+    if (currentMode == MODE_MANUAL)
+    {
+        if (newValueFlag) {
+            newValueFlag=0;
+            ProcessManualCommand();
+        }
+    }
+    else if (currentMode == MODE_AUTO)
+    {
+        HandleDistanceAndAutoBehavior();
+
+        if (newValueFlag && (rxData=='S' || rxData=='0')) {
+            newValueFlag=0;
+            SetMotorDirection_Safe();
+            targetCcrLeft=0; targetCcrRight=0;
+            char msg[] = "[AUTO] Emergency Stop\r\n";
+            HAL_UART_Transmit(&huart2,(uint8_t*)msg,strlen(msg),100);
+        }
+    }
+
+    UpdateMotorSpeed();
+}
+
+// ----- 초기화 -----
+void Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+
+    currentCcrLeft = 0;
+    currentCcrRight = 0;
+    targetCcrLeft = 0;
+    targetCcrRight = 0;
+    SetMotorDirection_Safe();
+    currentMode = GetCurrentMode();
+
+    HAL_UART_Receive_IT(&huart1, &rxData, 1);
+
+    char msg[40];
+    sprintf(msg, "[INIT] Mode: %s\r\n", (currentMode == MODE_AUTO) ? "AUTO" : "MANUAL");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}

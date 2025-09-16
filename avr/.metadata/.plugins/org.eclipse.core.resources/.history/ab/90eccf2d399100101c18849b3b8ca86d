@@ -1,0 +1,241 @@
+#include "ir.h"
+#include "stm32f4xx_hal.h"
+#include <math.h>  // fabsf
+
+extern ADC_HandleTypeDef hadc1;
+
+// 실제 변수 정의
+volatile float ir_distance[IR_NUM] = {0};
+volatile float ir0_distance = 0;
+volatile float ir1_distance = 0;
+volatile float ir2_distance = 0;
+volatile float ir3_distance = 0;
+
+// 더미 모드 변수
+static uint8_t ir_dummy_mode = 0; // 1=더미값 사용, 0=실제 ADC 사용
+volatile float ir_dummy_vals[IR_NUM] = {10.0, 20.0, 30.0, 40.0};
+
+// 물체 탐지 관련 변수
+static uint8_t object_detected = 0;
+static uint32_t no_object_counter = 0;
+static uint32_t object_lost_timestamp = 0;
+
+// ADC 채널
+static const uint32_t ir_channel[IR_NUM] = {
+    ADC_CHANNEL_0,  // LEFT
+    ADC_CHANNEL_1,  // RIGHT
+    ADC_CHANNEL_4,  // UP
+    ADC_CHANNEL_5   // DOWN
+};
+
+static uint8_t ir_idx = 0;
+static uint8_t ir_reading_active = 0; // ADC 읽기 활성화 플래그
+
+// 최소/최대 거리 제한
+#define IR_MIN_DISTANCE 10.0f
+#define IR_MAX_DISTANCE 150.0f  // 탐지 범위 확장
+// 최대 1회 변화폭 제한 (센서 잡음 방지)
+#define IR_MAX_STEP 25.0f
+
+// 물체 탐지 임계값
+#define DETECTION_THRESHOLD 100.0f    // 물체 탐지 임계값 (cm)
+#define NO_OBJECT_CONFIRM_COUNT 10    // 물체 없음 확정을 위한 연속 카운트
+#define OBJECT_CONFIRM_COUNT 3        // 물체 있음 확정을 위한 연속 카운트
+
+void IR_Init(void)
+{
+    ir_idx = 0;
+    ir_reading_active = 0;
+    object_detected = 0;
+    no_object_counter = 0;
+    object_lost_timestamp = 0;
+
+    // 초기값 설정 (물체 없음 상태로 시작)
+    for(int i = 0; i < IR_NUM; i++) {
+        ir_distance[i] = IR_MAX_DISTANCE;
+    }
+    ir0_distance = ir1_distance = ir2_distance = ir3_distance = IR_MAX_DISTANCE;
+}
+
+// -----------------------------
+// ADC 채널 설정 및 시작
+// -----------------------------
+static void IR_StartADC(uint8_t idx)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ir_channel[idx];
+    sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_Start_IT(&hadc1);
+}
+
+void IR_StartReadAll(void)
+{
+    if(!ir_dummy_mode && !ir_reading_active) {
+        ir_reading_active = 1;
+        ir_idx = 0;
+        IR_StartADC(ir_idx);
+    }
+}
+
+// -----------------------------
+// 물체 탐지 상태 확인
+// -----------------------------
+uint8_t IR_IsObjectDetected(void)
+{
+    return object_detected;
+}
+
+// 물체를 잃어버린 시간 반환 (ms)
+uint32_t IR_GetObjectLostTime(void)
+{
+    if(object_detected) return 0;
+    return HAL_GetTick() - object_lost_timestamp;
+}
+
+// 가장 가까운 센서의 거리 반환
+float IR_GetMinDistance(void)
+{
+    float min_dist = IR_MAX_DISTANCE;
+    for(int i = 0; i < IR_NUM; i++) {
+        if(ir_distance[i] < min_dist) {
+            min_dist = ir_distance[i];
+        }
+    }
+    return min_dist;
+}
+
+// 물체가 어느 방향에 있는지 반환 (0=LEFT, 1=RIGHT, 2=UP, 3=DOWN, -1=없음)
+int8_t IR_GetObjectDirection(void)
+{
+    if(!object_detected) return -1;
+
+    float min_dist = IR_MAX_DISTANCE;
+    int8_t direction = -1;
+
+    for(int i = 0; i < IR_NUM; i++) {
+        if(ir_distance[i] < min_dist && ir_distance[i] < DETECTION_THRESHOLD) {
+            min_dist = ir_distance[i];
+            direction = i;
+        }
+    }
+    return direction;
+}
+
+// -----------------------------
+// ADC 완료 콜백 (또는 HAL에서 호출)
+// -----------------------------
+void IR_IRQHandler(void)
+{
+    float distance;
+
+    if(ir_dummy_mode) {
+        distance = ir_dummy_vals[ir_idx];
+    } else {
+        uint32_t adcValue = HAL_ADC_GetValue(&hadc1);
+        float voltage = (adcValue / 4095.0f) * 3.3f;
+        distance = (voltage > 0.42f) ? (27.86f / (voltage - 0.42f)) : IR_MAX_DISTANCE;
+
+        // 최소/최대 거리 제한
+        if(distance < IR_MIN_DISTANCE) distance = IR_MIN_DISTANCE;
+        if(distance > IR_MAX_DISTANCE) distance = IR_MAX_DISTANCE;
+
+        // ---------------------------
+        // 급격한 변화 제한
+        // ---------------------------
+        float prev = ir_distance[ir_idx];
+        float diff = distance - prev;
+        if(diff > IR_MAX_STEP) distance = prev + IR_MAX_STEP;
+        else if(diff < -IR_MAX_STEP) distance = prev - IR_MAX_STEP;
+
+        // ---------------------------
+        // 가중 이동평균 필터
+        // 물체 탐지용으로 반응성 향상 (0.5:0.5)
+        // ---------------------------
+        distance = prev * 0.5f + distance * 0.5f;
+
+        // ---------------------------
+        // Deadband: 미세 진동 제거 (물체 탐지용으로 작게)
+        // 변화량이 ±0.3 이내면 이전 값 유지
+        // ---------------------------
+        if(fabsf(distance - prev) < 0.3f) {
+            distance = prev;
+        }
+    }
+
+    // 배열과 개별 변수 업데이트
+    ir_distance[ir_idx] = distance;
+    switch(ir_idx) {
+        case 0: ir0_distance = distance; break;
+        case 1: ir1_distance = distance; break;
+        case 2: ir2_distance = distance; break;
+        case 3: ir3_distance = distance; break;
+    }
+
+    ir_idx++;
+
+    // 모든 채널 읽기 완료 시 물체 탐지 상태 업데이트
+    if(ir_idx >= IR_NUM) {
+        ir_idx = 0;
+        ir_reading_active = 0; // 읽기 완료
+
+        // 물체 탐지 로직
+        uint8_t any_object = 0;
+        for(int i = 0; i < IR_NUM; i++) {
+            if(ir_distance[i] < DETECTION_THRESHOLD) {
+                any_object = 1;
+                break;
+            }
+        }
+
+        if(any_object) {
+            if(!object_detected) {
+                // 물체 탐지됨
+                object_detected = 1;
+                no_object_counter = 0;
+            }
+        } else {
+            // 물체 없음
+            no_object_counter++;
+            if(no_object_counter >= NO_OBJECT_CONFIRM_COUNT && object_detected) {
+                // 물체 잃어버림 확정
+                object_detected = 0;
+                object_lost_timestamp = HAL_GetTick();
+                no_object_counter = 0;
+            }
+        }
+    } else if(!ir_dummy_mode) {
+        IR_StartADC(ir_idx);
+    }
+}
+
+// -----------------------------
+// 외부에서 더미값 업데이트 가능
+// -----------------------------
+void IR_SetDummyValue(uint8_t idx, float value)
+{
+    if(idx < IR_NUM) {
+        ir_dummy_vals[idx] = value;
+    }
+}
+
+// 더미 모드 설정/해제
+void IR_SetDummyMode(uint8_t enable)
+{
+    ir_dummy_mode = enable;
+}
+
+// 물체 탐지 임계값 동적 변경
+void IR_SetDetectionThreshold(float threshold)
+{
+    // 이 함수를 사용하려면 DETECTION_THRESHOLD를 static 변수로 변경 필요
+}
+
+// 강제로 물체 탐지 상태 리셋
+void IR_ResetDetectionState(void)
+{
+    object_detected = 0;
+    no_object_counter = 0;
+    object_lost_timestamp = HAL_GetTick();
+}

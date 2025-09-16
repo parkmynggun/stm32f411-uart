@@ -1,0 +1,10 @@
+17:47:24 **** Incremental Build of configuration Debug for project LRF ****
+make -j4 all 
+arm-none-eabi-size  LRF.elf 
+   text	   data	    bss	    dec	    hex	filename
+  16816	     32	   1896	  18744	   4938	LRF.elf
+Finished building: default.size.stdout
+ 
+
+17:47:24 Build Finished. 0 errors, 0 warnings. (took 150ms)
+

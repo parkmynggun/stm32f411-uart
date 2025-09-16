@@ -1,0 +1,138 @@
+#include "ir.h"
+#include "stm32f4xx_hal.h"
+
+extern ADC_HandleTypeDef hadc1;
+
+// 실제 변수 정의
+volatile float ir_distance[IR_NUM] = {0};
+volatile float ir0_distance = 0;
+volatile float ir1_distance = 0;
+volatile float ir2_distance = 0;
+volatile float ir3_distance = 0;
+
+// 더미 모드 변수
+static uint8_t ir_dummy_mode = 0; // 1=더미값 사용, 0=실제 ADC 사용
+volatile float ir_dummy_vals[IR_NUM] = {10.0, 20.0, 30.0, 40.0};
+
+// ADC 채널
+static const uint32_t ir_channel[IR_NUM] = {
+    ADC_CHANNEL_0,
+    ADC_CHANNEL_1,
+    ADC_CHANNEL_4,
+    ADC_CHANNEL_5
+};
+
+static uint8_t ir_idx = 0;
+static uint8_t ir_reading_active = 0; // ADC 읽기 활성화 플래그
+
+// 최소/최대 거리 제한
+#define IR_MIN_DISTANCE 10.0f
+#define IR_MAX_DISTANCE 80.0f
+// 최대 1회 변화폭 제한 (센서 잡음 방지)
+#define IR_MAX_STEP 20.0f
+
+void IR_Init(void)
+{
+    ir_idx = 0;
+    ir_reading_active = 0;
+
+    // 초기값 설정
+    for(int i = 0; i < IR_NUM; i++) {
+        ir_distance[i] = 80.0f; // 중간값 초기화
+    }
+    ir0_distance = ir1_distance = ir2_distance = ir3_distance = 80.0f;
+}
+
+// -----------------------------
+// ADC 채널 설정 및 시작
+// -----------------------------
+static void IR_StartADC(uint8_t idx)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ir_channel[idx];
+    sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_Start_IT(&hadc1);
+}
+
+void IR_StartReadAll(void)
+{
+    if(!ir_dummy_mode && !ir_reading_active) {
+        ir_reading_active = 1;
+        ir_idx = 0;
+        IR_StartADC(ir_idx);
+    }
+}
+
+// -----------------------------
+// ADC 완료 콜백 (또는 HAL에서 호출)
+// -----------------------------
+void IR_IRQHandler(void)
+{
+    float distance;
+
+    if(ir_dummy_mode) {
+        distance = ir_dummy_vals[ir_idx];
+    } else {
+        uint32_t adcValue = HAL_ADC_GetValue(&hadc1);
+        float voltage = (adcValue / 4095.0f) * 3.3f;
+        distance = (voltage > 0.42f) ? (27.86f / (voltage - 0.42f)) : 80.0f;
+
+        // 최소/최대 거리 제한
+        if(distance < IR_MIN_DISTANCE) distance = IR_MIN_DISTANCE;
+        if(distance > IR_MAX_DISTANCE) distance = IR_MAX_DISTANCE;
+
+        // ---------------------------
+        // 급격한 변화 제한
+        // ---------------------------
+        float prev = ir_distance[ir_idx];
+        float diff = distance - prev;
+        if(diff > IR_MAX_STEP) distance = prev + IR_MAX_STEP;
+        else if(diff < -IR_MAX_STEP) distance = prev - IR_MAX_STEP;
+
+        // ---------------------------
+        // 가중 이동평균 필터
+        // 이전 값 비중을 크게, 새 값은 작게
+        // ---------------------------
+        distance = prev * 0.7f + distance * 0.3f;
+
+        // ---------------------------
+        // Deadband: 미세 진동 제거
+        // 변화량이 ±0.5 이내면 이전 값 유지
+        // ---------------------------
+        if(fabsf(distance - prev) < 0.5f) {
+            distance = prev;
+        }
+    }
+
+    // 배열과 개별 변수 업데이트
+    ir_distance[ir_idx] = distance;
+    switch(ir_idx) {
+        case 0: ir0_distance = distance; break;
+        case 1: ir1_distance = distance; break;
+        case 2: ir2_distance = distance; break;
+        case 3: ir3_distance = distance; break;
+    }
+
+    ir_idx++;
+
+    // 모든 채널 읽기 완료 시 중지
+    if(ir_idx >= IR_NUM) {
+        ir_idx = 0;
+        ir_reading_active = 0; // 읽기 완료
+    } else if(!ir_dummy_mode) {
+        IR_StartADC(ir_idx);
+    }
+}
+
+
+// -----------------------------
+// 외부에서 더미값 업데이트 가능
+// -----------------------------
+void IR_SetDummyValue(uint8_t idx, float value)
+{
+    if(idx < IR_NUM) {
+        ir_dummy_vals[idx] = value;
+    }
+}

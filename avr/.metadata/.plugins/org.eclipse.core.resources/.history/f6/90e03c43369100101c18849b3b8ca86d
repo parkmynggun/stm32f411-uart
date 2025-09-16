@@ -1,0 +1,151 @@
+#include "pid_motor.h"
+#include "tim.h"
+#include "gpio.h"
+#include <math.h>  // fabsf
+#include "motor.h" // IsDoorOpen() 사용
+
+// -----------------------------
+// PID 상태 변수 (좌우/상하 분리)
+static float pid_integral_lr = 0;
+static float pid_prev_error_lr = 0;
+static float pid_integral_ud = 0;
+static float pid_prev_error_ud = 0;
+
+// 물체 탐지 플래그
+static uint8_t search_mode = 1;  // 1=탐색모드(회전), 0=추적모드(PID)
+
+// 디버깅용 변수
+float pid_output_debug = 0;
+float pid_p_debug_lr = 0;
+float pid_i_debug_lr = 0;
+float pid_d_debug_lr = 0;
+float pid_p_debug_ud = 0;
+float pid_i_debug_ud = 0;
+float pid_d_debug_ud = 0;
+
+// -----------------------------
+// DC 모터 핀 정의
+#define MOTOR_LR_IN1_PORT GPIOC
+#define MOTOR_LR_IN1_PIN  GPIO_PIN_0
+#define MOTOR_LR_IN2_PORT GPIOC
+#define MOTOR_LR_IN2_PIN  GPIO_PIN_1
+#define MOTOR_LR_PWM_CHANNEL TIM_CHANNEL_2
+#define MOTOR_LR_PWM_TIMER   &htim3
+
+#define MOTOR_UD_IN1_PORT GPIOB
+#define MOTOR_UD_IN1_PIN  GPIO_PIN_1
+#define MOTOR_UD_IN2_PORT GPIOB
+#define MOTOR_UD_IN2_PIN  GPIO_PIN_2
+#define MOTOR_UD_PWM_CHANNEL TIM_CHANNEL_3
+#define MOTOR_UD_PWM_TIMER   &htim3
+
+#define MOTOR_PWM_NEUTRAL 0
+#define MOTOR_PWM_MAX     999
+#define MOTOR_PWM_MIN     0
+
+// -----------------------------
+// 초기화
+void PID_Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    HAL_TIM_PWM_Start(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    pid_integral_lr = 0;
+    pid_prev_error_lr = 0;
+    pid_integral_ud = 0;
+    pid_prev_error_ud = 0;
+
+    search_mode = 1;  // 시작시 탐색모드
+
+    HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+}
+
+// -----------------------------
+// Turret PID 제어 + DC 모터 제어
+void Turret_PID_Control(float dt, float ir_distances[])
+{
+    // ... (함수 시작 부분과 문 닫힘 처리 로직은 기존과 동일) ...
+
+    // ★★★ 추적모드: PID 제어 ★★★
+    // PID 상수 (이 값들은 환경에 맞게 다시 튜닝해야 할 수 있습니다)
+    const float Kp_lr = 5.8f, Ki_lr = 0.3f, Kd_lr = 0.1f;
+    const float Kp_ud = 5.8f, Ki_ud = 0.3f, Kd_ud = 0.1f;
+    const float ERROR_THRESHOLD = 5.0f; // 이 오차 범위 안에서는 움직이지 않음
+    const float INTEGRAL_MAX = 50.0f;   // 적분값이 과도하게 커지는 것을 방지
+
+    // ==========================================================
+    // 1. 오차 계산 방식 수정 (가장 중요한 변경점)
+    // (왼쪽이 가까우면 음수, 오른쪽이 가까우면 양수가 나오도록)
+    // ==========================================================
+    float error_lr = left - right;
+    float error_ud = up - down;
+
+    // 데드존 적용: 오차가 매우 작을 경우, 새로운 계산을 하지 않고 정지 상태 유지
+    if (fabsf(error_lr) < ERROR_THRESHOLD) {
+        error_lr = 0;
+        // 중요: 적분항을 0으로 리셋하지 않고, 더 이상 누적만 하지 않도록 함
+    }
+    pid_integral_lr += error_lr * dt;
+
+    // 적분값 제한 (Anti-windup)
+    if (pid_integral_lr > INTEGRAL_MAX) pid_integral_lr = INTEGRAL_MAX;
+    else if (pid_integral_lr < -INTEGRAL_MAX) pid_integral_lr = -INTEGRAL_MAX;
+
+    // 미분항 계산
+    float derivative_lr = (error_lr - pid_prev_error_lr) / dt;
+    pid_prev_error_lr = error_lr;
+
+    // 최종 PID 출력 계산
+    float output_lr = (Kp_lr * error_lr) + (Ki_lr * pid_integral_lr) + (Kd_lr * derivative_lr);
+
+    // (디버깅용 변수 업데이트)
+    pid_p_debug_lr = Kp_lr * error_lr;
+    pid_i_debug_lr = Ki_lr * pid_integral_lr;
+    pid_d_debug_lr = Kd_lr * derivative_lr;
+
+
+    // --- 상하 PID 계산 (좌우와 동일한 로직) ---
+    if (fabsf(error_ud) < ERROR_THRESHOLD) {
+        error_ud = 0;
+    }
+    pid_integral_ud += error_ud * dt;
+
+    if (pid_integral_ud > INTEGRAL_MAX) pid_integral_ud = INTEGRAL_MAX;
+    else if (pid_integral_ud < -INTEGRAL_MAX) pid_integral_ud = -INTEGRAL_MAX;
+
+    float derivative_ud = (error_ud - pid_prev_error_ud) / dt;
+    pid_prev_error_ud = error_ud;
+
+    float output_ud = (Kp_ud * error_ud) + (Ki_ud * pid_integral_ud) + (Kd_ud * derivative_ud);
+
+    (디버깅용 변수 업데이트)
+    pid_p_debug_ud = Kp_ud * error_ud;
+    pid_i_debug_ud = Ki_ud * pid_integral_ud;
+    pid_d_debug_ud = Kd_ud * derivative_ud;
+
+    // PID 출력을 실제 PWM 값으로 변환
+    int16_t pwm_lr = (int16_t)output_lr;
+    int16_t pwm_ud = (int16_t)output_ud;
+
+    // PWM 출력 제한
+    if (pwm_lr > MOTOR_PWM_MAX) pwm_lr = MOTOR_PWM_MAX;
+    if (pwm_lr < -MOTOR_PWM_MAX) pwm_lr = -MOTOR_PWM_MAX;
+    if (pwm_ud > MOTOR_PWM_MAX) pwm_ud = MOTOR_PWM_MAX;
+    if (pwm_ud < -MOTOR_PWM_MAX) pwm_ud = -MOTOR_PWM_MAX;
+
+    // ==========================================================
+    // 2. 최소 PWM 강제 설정 로직 제거
+    //    (PID 튜닝으로 해결하는 것이 더 안정적입니다)
+    // ==========================================================
+
+    // (모터가 아주 작은 PWM 값에서 움직이지 못한다면, Kp 값을 약간 높여보세요)
+
+    // PWM 적용 및 모터 방향 설정 (기존과 동일)
+    // ...
+}

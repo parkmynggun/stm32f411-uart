@@ -1,0 +1,85 @@
+// ----- motor.c 상단, 변수 정의 뒤 -----
+
+// 필터링된 최종 ADC 값
+volatile uint32_t adc_scaled[4] = {0,0,0,0};
+
+// UART 버퍼
+uint8_t rxData = 0;
+uint8_t rxBuf[RX_BUF_SIZE];
+volatile uint8_t rxIndex = 0;
+
+// --- 들어온 한 줄 문자열 처리 ---
+void ProcessReceivedLine(uint8_t *line)
+{
+    // 문자열 디버깅 출력
+    char dbg[80];
+    sprintf(dbg, "RAW:'%s'\r\n", (char*)line);
+    HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), 100);
+
+    // "ADC:"로 시작하면 파싱
+    if (strncmp((char*)line, "ADC:", 4) == 0) {
+        uint32_t tmp[4] = {0};
+
+        int parsed = sscanf((char*)line, "ADC:%lu,%lu,%lu,%lu",
+                            &tmp[0], &tmp[1], &tmp[2], &tmp[3]);
+
+        if (parsed == 4) {
+            adc_scaled[0] = tmp[0];
+            adc_scaled[1] = tmp[1];
+            adc_scaled[2] = tmp[2];
+            adc_scaled[3] = tmp[3];
+        }
+
+        sprintf(dbg, "PARSED=%d [%lu,%lu,%lu,%lu]\r\n",
+                parsed, adc_scaled[0], adc_scaled[1], adc_scaled[2], adc_scaled[3]);
+        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), 100);
+    }
+}
+
+// --- UART 수신 인터럽트 콜백 수정 ---
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        if(rxIndex < RX_BUF_SIZE - 1) {
+            rxBuf[rxIndex++] = rxData;
+        } else {
+            rxIndex = 0; // overflow 시 초기화
+        }
+
+        // 줄바꿈 문자 확인
+        if(rxData == '\n' || rxData == '\r') {
+            if(rxIndex > 0) rxBuf[rxIndex-1] = '\0';
+            else rxBuf[0] = '\0';
+
+            if(strlen((char*)rxBuf) > 0)
+                ProcessReceivedLine(rxBuf);
+
+            rxIndex = 0;
+        }
+
+        // 다음 문자 수신 준비
+        HAL_UART_Receive_IT(&huart1, &rxData, 1);
+    }
+}
+
+// ----- Motor_Init()에서 UART 인터럽트 시작 -----
+void Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_2);
+
+    currentCcrLeft = 0;
+    currentCcrRight = 0;
+    targetCcrLeft = 0;
+    targetCcrRight = 0;
+    SetMotorDirection_Safe();
+    currentMode = GetCurrentMode();
+
+    // 🔹 여기서 UART 수신 인터럽트 시작
+    HAL_UART_Receive_IT(&huart1, &rxData, 1);
+
+    char msg[40];
+    sprintf(msg, "[INIT] Mode: %s\r\n", (currentMode == MODE_AUTO) ? "AUTO" : "MANUAL");
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}

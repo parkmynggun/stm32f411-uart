@@ -1,0 +1,5 @@
+../Core/Src/motor.c:19:16:readDebounce	16	static
+../Core/Src/motor.c:33:6:Motor_Init	8	static
+../Core/Src/motor.c:45:6:Motor_HandleInput	8	static
+../Core/Src/motor.c:72:9:IsDoorOpen	4	static
+../Core/Src/motor.c:76:6:Motor_TestLoop	8	static

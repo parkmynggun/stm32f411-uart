@@ -1,0 +1,139 @@
+#include "pid_motor.h"
+#include "tim.h"
+#include "gpio.h"
+#include <math.h>
+#include "motor.h"
+
+// -----------------------------
+// PID 상태 변수
+static float pid_integral_lr = 0;
+static float pid_prev_error_lr = 0;
+static float pid_integral_ud = 0;
+static float pid_prev_error_ud = 0;
+
+// 디버깅용
+float pid_output_debug_lr = 0;
+float pid_output_debug_ud = 0;
+
+// -----------------------------
+// DC 모터 핀 정의
+#define MOTOR_LR_IN1_PORT GPIOC
+#define MOTOR_LR_IN1_PIN  GPIO_PIN_0
+#define MOTOR_LR_IN2_PORT GPIOC
+#define MOTOR_LR_IN2_PIN  GPIO_PIN_1
+#define MOTOR_LR_PWM_CHANNEL TIM_CHANNEL_2
+#define MOTOR_LR_PWM_TIMER   &htim3
+
+#define MOTOR_UD_IN1_PORT GPIOB
+#define MOTOR_UD_IN1_PIN  GPIO_PIN_1
+#define MOTOR_UD_IN2_PORT GPIOB
+#define MOTOR_UD_IN2_PIN  GPIO_PIN_2
+#define MOTOR_UD_PWM_CHANNEL TIM_CHANNEL_3
+#define MOTOR_UD_PWM_TIMER   &htim3
+
+#define MOTOR_PWM_NEUTRAL 0
+#define MOTOR_PWM_MAX     999
+
+// -----------------------------
+// 초기화
+void PID_Motor_Init(void)
+{
+    HAL_TIM_PWM_Start(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    HAL_TIM_PWM_Start(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL);
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+
+    pid_integral_lr = 0;
+    pid_prev_error_lr = 0;
+    pid_integral_ud = 0;
+    pid_prev_error_ud = 0;
+
+    HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+}
+
+// -----------------------------
+// Turret PID 제어
+void Turret_PID_Control(float dt, float ir_distances[])
+{
+    if(!IsDoorOpen()) {
+        // 문 닫힘 시 모터 정지
+        __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+        __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, MOTOR_PWM_NEUTRAL);
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+        return;
+    }
+
+    // IR 센서: [0]=왼쪽, [1]=오른쪽, [2]=위, [3]=아래
+    float left  = ir_distances[0];
+    float right = ir_distances[1];
+    float up    = ir_distances[2];
+    float down  = ir_distances[3];
+
+    // -----------------------------
+    // PID 상수
+    const float Kp_lr = 1.0f, Ki_lr = 0.8f, Kd_lr = 0.2f;
+    const float Kp_ud = 1.0f, Ki_ud = 0.8f, Kd_ud = 0.2f;
+
+    // -----------------------------
+    // 좌우 PID
+    float error_lr = left - right; // 왼쪽이 가까우면 반시계 방향, 오른쪽이 가까우면 시계 방향
+    pid_integral_lr += error_lr * dt;
+    float derivative_lr = (error_lr - pid_prev_error_lr) / dt;
+    pid_prev_error_lr = error_lr;
+
+    float output_lr = Kp_lr*error_lr + Ki_lr*pid_integral_lr + Kd_lr*derivative_lr;
+    pid_output_debug_lr = output_lr;
+
+    // -----------------------------
+    // 상하 PID
+    float error_ud = up - down; // 위가 가까우면 위쪽, 아래가 가까우면 아래쪽
+    pid_integral_ud += error_ud * dt;
+    float derivative_ud = (error_ud - pid_prev_error_ud) / dt;
+    pid_prev_error_ud = error_ud;
+
+    float output_ud = Kp_ud*error_ud + Ki_ud*pid_integral_ud + Kd_ud*derivative_ud;
+    pid_output_debug_ud = output_ud;
+
+    // -----------------------------
+    // 출력 제한
+    if(output_lr > 100.0f) output_lr = 100.0f;
+    else if(output_lr < -100.0f) output_lr = -100.0f;
+
+    if(output_ud > 100.0f) output_ud = 100.0f;
+    else if(output_ud < -100.0f) output_ud = -100.0f;
+
+    // PWM 계산
+    int16_t pwm_lr = (int16_t)(fabsf(output_lr)*7.0f);
+    int16_t pwm_ud = (int16_t)(fabsf(output_ud)*7.0f);
+
+    if(pwm_lr > MOTOR_PWM_MAX) pwm_lr = MOTOR_PWM_MAX;
+    if(pwm_ud > MOTOR_PWM_MAX) pwm_ud = MOTOR_PWM_MAX;
+
+    __HAL_TIM_SET_COMPARE(MOTOR_LR_PWM_TIMER, MOTOR_LR_PWM_CHANNEL, pwm_lr);
+    __HAL_TIM_SET_COMPARE(MOTOR_UD_PWM_TIMER, MOTOR_UD_PWM_CHANNEL, pwm_ud);
+
+    // -----------------------------
+    // 모터 방향 설정
+    if(output_lr >= 0) {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_RESET);
+    } else {
+        HAL_GPIO_WritePin(MOTOR_LR_IN1_PORT, MOTOR_LR_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_LR_IN2_PORT, MOTOR_LR_IN2_PIN, GPIO_PIN_SET);
+    }
+
+    if(output_ud >= 0) {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_RESET);
+    } else {
+        HAL_GPIO_WritePin(MOTOR_UD_IN1_PORT, MOTOR_UD_IN1_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(MOTOR_UD_IN2_PORT, MOTOR_UD_IN2_PIN, GPIO_PIN_SET);
+    }
+}

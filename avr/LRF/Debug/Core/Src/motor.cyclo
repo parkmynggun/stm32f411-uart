@@ -1,0 +1,5 @@
+../Core/Src/motor.c:19:16:readDebounce	3
+../Core/Src/motor.c:33:6:Motor_Init	1
+../Core/Src/motor.c:45:6:Motor_HandleInput	5
+../Core/Src/motor.c:72:9:IsDoorOpen	1
+../Core/Src/motor.c:76:6:Motor_TestLoop	1
